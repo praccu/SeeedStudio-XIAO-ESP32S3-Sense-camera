@@ -1,5 +1,4 @@
 #include "esp_camera.h"
-#include <WiFi.h>
 
 //
 // WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
@@ -15,21 +14,57 @@
 // ===================
 #define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
 #include "camera_pins.h"
+#include <vector>
+#include "human_face_detect_msr01.hpp"
+#include "human_face_detect_mnp01.hpp"
+#include "esp32-hal-ledc.h"
+#include "sdkconfig.h"
+#include "camera_index.h"
+#include <ESP32Servo.h>
+#include <optional>
+
 
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char *ssid = "**********";
-const char *password = "**********";
 
-void startCameraServer();
-void setupLedFlash(int pin);
+#pragma GCC diagnostic ignored "-Wformat"
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#include "face_recognition_tool.hpp"
+#include "face_recognition_112_v1_s16.hpp"
+#include "face_recognition_112_v1_s8.hpp"
+#pragma GCC diagnostic error "-Wformat"
+#pragma GCC diagnostic warning "-Wstrict-aliasing"
+#define QUANT_TYPE 0
+#define FACE_ID_SAVE_NUMBER 7
+
+#define FACE_COLOR_WHITE  0x00FFFFFF
+#define FACE_COLOR_BLACK  0x00000000
+#define FACE_COLOR_RED    0x000000FF
+#define FACE_COLOR_GREEN  0x0000FF00
+#define FACE_COLOR_BLUE   0x00FF0000
+#define FACE_COLOR_YELLOW (FACE_COLOR_RED | FACE_COLOR_GREEN)
+#define FACE_COLOR_CYAN   (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
+#define FACE_COLOR_PURPLE (FACE_COLOR_BLUE | FACE_COLOR_RED)
+#define LED_LEDC_GPIO            22  //configure LED pin
+#define CONFIG_LED_MAX_INTENSITY 255
+
+int led_duty = 0;
+bool isStreaming = false;
+
+Servo richardServoY;
+Servo richardServoX;
+
+
+void setupLedFlash(int pin) {
+  ledcAttach(pin, 5000, 8);
+}
 
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
-
+  Serial.print("starting.\n");
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -51,8 +86,8 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.frame_size = FRAMESIZE_UXGA;
-  config.pixel_format = PIXFORMAT_JPEG;  // for streaming
-  //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
+  //config.pixel_format = PIXFORMAT_JPEG;  // for streaming
+  config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
@@ -116,24 +151,84 @@ void setup() {
   setupLedFlash(LED_GPIO_NUM);
 #endif
 
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
+// Servo config
+	// Allow allocation of all timers
+	ESP32PWM::allocateTimer(0);
+	ESP32PWM::allocateTimer(1);
+	ESP32PWM::allocateTimer(2);
+	ESP32PWM::allocateTimer(3);
+	richardServoX.setPeriodHertz(50);    // standard 50 hz servo
+  richardServoY.setPeriodHertz(50);
+	richardServoX.attach(0, 1000, 2000); // attaches the servo on pin 18 to the servo object
+  richardServoY.attach(1, 1000, 2000);
+	// using default min/max of 1000us and 2000us
+	// different servos may require different min/max settings
+	// for an accurate 0 to 180 sweep
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected");
-
-  startCameraServer();
-
-  Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
 }
 
+typedef std::pair<int, int> Coords;
+
+std::optional<Coords> getFaceCoordinates(camera_fb_t* fb) {
+    HumanFaceDetectMSR01 s1(0.1F, 0.5F, 10, 0.2F);
+    std::list<dl::detect::result_t> &results = s1.infer((uint16_t *)fb->buf, {(int)fb->height, (int)fb->width, 3});
+
+    if (results.empty()) { return std::nullopt; }
+    Serial.print("Found results.\n");
+
+    Coords closestCoordinates;
+    int bestDistance = 100000000;
+    for (const auto& prediction : results) {
+      int x = (int)prediction.box[0];
+      int y = (int)prediction.box[1];
+
+      int thisDist = x*x + y*y;
+      if (thisDist < bestDistance) {
+        closestCoordinates.first = x;
+        closestCoordinates.second = y;
+        bestDistance = thisDist;
+      }
+    }
+    return closestCoordinates;
+
+}
+
+
+
+Coords servoCoordinates = std::make_pair<int, int>(90, 90);
+
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
-  delay(10000);
+  camera_fb_t *fb = esp_camera_fb_get(); 
+ 
+  if (fb != NULL && fb->format == PIXFORMAT_RGB565) {
+    std::optional<Coords> faceCoords = getFaceCoordinates(fb);
+
+    // if we lose the face, slowly move back to center.
+    if (faceCoords) {
+      int x = faceCoords.value().first;
+      int y = faceCoords.value().second;
+      Serial.print("Found face ");
+      Serial.print(String(x));
+      Serial.print("\n");
+      Serial.print(String(y));
+      Serial.print("\n");
+
+      if (x > 0) {
+        servoCoordinates.first = std::min(180, servoCoordinates.first + 1);
+      } else if (faceCoords.value().first < 0) {
+        servoCoordinates.first = std::max(0, servoCoordinates.first - 1);
+      }
+
+      if (faceCoords.value().second > 0) {
+        servoCoordinates.second = std::min(180, servoCoordinates.second + 1);
+      } else if (faceCoords.value().second < 0) {
+        servoCoordinates.second = std::max(0, servoCoordinates.second - 1);
+      }
+    }
+
+    richardServoX.write(servoCoordinates.first);
+    richardServoY.write(servoCoordinates.second);
+
+  }
+  esp_camera_fb_return(fb);
 }
