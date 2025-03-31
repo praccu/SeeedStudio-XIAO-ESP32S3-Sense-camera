@@ -159,8 +159,8 @@ void setup() {
 	ESP32PWM::allocateTimer(3);
 	richardServoX.setPeriodHertz(50);    // standard 50 hz servo
   richardServoY.setPeriodHertz(50);
-	richardServoX.attach(0, 1000, 2000); // attaches the servo on pin 18 to the servo object
-  richardServoY.attach(1, 1000, 2000);
+	richardServoX.attach(5, 1000, 2000);
+  richardServoY.attach(3, 1000, 2000);
 	// using default min/max of 1000us and 2000us
 	// different servos may require different min/max settings
 	// for an accurate 0 to 180 sweep
@@ -170,17 +170,19 @@ void setup() {
 typedef std::pair<int, int> Coords;
 
 std::optional<Coords> getFaceCoordinates(camera_fb_t* fb) {
-    HumanFaceDetectMSR01 s1(0.1F, 0.5F, 10, 0.2F);
+  // Calculate offset of center of face from center of camera.
+
+    HumanFaceDetectMSR01 s1(0.05F, 0.65F, 10, 0.2F);
     std::list<dl::detect::result_t> &results = s1.infer((uint16_t *)fb->buf, {(int)fb->height, (int)fb->width, 3});
 
     if (results.empty()) { return std::nullopt; }
-    Serial.print("Found results.\n");
 
     Coords closestCoordinates;
     int bestDistance = 100000000;
     for (const auto& prediction : results) {
-      int x = (int)prediction.box[0];
-      int y = (int)prediction.box[1];
+      // x: face x center, face y center
+      int x = (int) ( prediction.box[0] + (prediction.box[2] - prediction.box[0]) / 2 );
+      int y = (int) ( prediction.box[1] + (prediction.box[3] - prediction.box[1]) / 2);
 
       int thisDist = x*x + y*y;
       if (thisDist < bestDistance) {
@@ -197,7 +199,10 @@ std::optional<Coords> getFaceCoordinates(camera_fb_t* fb) {
 
 Coords servoCoordinates = std::make_pair<int, int>(90, 90);
 
+int last_logged = 0;
+
 void loop() {
+
   camera_fb_t *fb = esp_camera_fb_get(); 
  
   if (fb != NULL && fb->format == PIXFORMAT_RGB565) {
@@ -205,30 +210,37 @@ void loop() {
 
     // if we lose the face, slowly move back to center.
     if (faceCoords) {
-      int x = faceCoords.value().first;
-      int y = faceCoords.value().second;
-      Serial.print("Found face ");
-      Serial.print(String(x));
-      Serial.print("\n");
-      Serial.print(String(y));
-      Serial.print("\n");
+      int x = (faceCoords.value().first - fb->width / 2);
+      int y = (faceCoords.value().second - fb->height / 2);
+      if (last_logged % 10 == 0) {
+        Serial.print("Found face : (");
+        Serial.print(String(x));
+        Serial.print(", ");
+        Serial.print(String(y));
+        Serial.print(")\n");
+      }
 
       if (x > 0) {
-        servoCoordinates.first = std::min(180, servoCoordinates.first + 1);
-      } else if (faceCoords.value().first < 0) {
-        servoCoordinates.first = std::max(0, servoCoordinates.first - 1);
+        servoCoordinates.first = std::min(180, servoCoordinates.first + std::min(5, x));
+      } else if (x < 0) {
+        servoCoordinates.first = std::max(0, servoCoordinates.first + std::max(-5, x));
       }
 
-      if (faceCoords.value().second > 0) {
-        servoCoordinates.second = std::min(180, servoCoordinates.second + 1);
-      } else if (faceCoords.value().second < 0) {
-        servoCoordinates.second = std::max(0, servoCoordinates.second - 1);
+      if (y > 0) {
+        servoCoordinates.second = std::min(180, servoCoordinates.second + std::min(5, y));
+      } else if (y < 0) {
+        servoCoordinates.second = std::max(0, servoCoordinates.second + std::max(-5, y));
       }
+      if (last_logged % 10 == 0) {
+        Serial.print("Moving to : ("); Serial.print(String(servoCoordinates.first)); Serial.print(", ");
+        Serial.print(String(servoCoordinates.second)); Serial.print(")\n");
+      }
+      last_logged++;
     }
-
-    richardServoX.write(servoCoordinates.first);
-    richardServoY.write(servoCoordinates.second);
 
   }
   esp_camera_fb_return(fb);
+  richardServoX.write(servoCoordinates.first);
+  richardServoY.write(servoCoordinates.second);
+  delay(15);
 }
